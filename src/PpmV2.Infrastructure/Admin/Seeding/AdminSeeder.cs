@@ -57,6 +57,7 @@ public static class AdminSeeder
 
         // Find or create the admin identity user.
         var user = await userManager.FindByEmailAsync(email);
+        var adminAlreadyExisted = user is not null;
 
         if (user == null)
         {
@@ -148,6 +149,68 @@ public static class AdminSeeder
                 logger.LogInformation("AdminSeeder: updated admin profile for {Email}", email);
             }
         }
+
+        if (!adminAlreadyExisted)
+            return;
+
+        var resetPasswordOnStart = bool.TryParse(section["ResetPasswordOnStart"], out var shouldReset) && shouldReset;
+        if (!resetPasswordOnStart)
+            return;
+
+        await ResetExistingAdminPasswordAsync(userManager, dbContext, user, password, timeProvider, logger);
+    }
+
+    private static async Task ResetExistingAdminPasswordAsync(
+        UserManager<AppUser> userManager,
+        AppDbContext dbContext,
+        AppUser user,
+        string configuredPassword,
+        TimeProvider timeProvider,
+        ILogger logger)
+    {
+        if (await userManager.CheckPasswordAsync(user, configuredPassword))
+            return;
+
+        if (await userManager.HasPasswordAsync(user))
+        {
+            var removeResult = await userManager.RemovePasswordAsync(user);
+            if (!removeResult.Succeeded)
+            {
+                LogIdentityErrors(logger, "AdminSeeder: failed to remove admin password.", removeResult);
+                return;
+            }
+        }
+
+        var addResult = await userManager.AddPasswordAsync(user, configuredPassword);
+        if (!addResult.Succeeded)
+        {
+            LogIdentityErrors(logger, "AdminSeeder: failed to set admin password.", addResult);
+            return;
+        }
+
+        var stampResult = await userManager.UpdateSecurityStampAsync(user);
+        if (!stampResult.Succeeded)
+            LogIdentityErrors(logger, "AdminSeeder: failed to update admin security stamp.", stampResult);
+
+        var revokedAt = timeProvider.GetUtcNow().UtcDateTime;
+        var tokens = await dbContext.RefreshTokens
+            .Where(t => t.UserId == user.Id && t.RevokedAt == null)
+            .ToListAsync();
+
+        foreach (var token in tokens)
+            token.RevokedAt = revokedAt;
+
+        if (tokens.Count > 0)
+            await dbContext.SaveChangesAsync();
+
+        if (stampResult.Succeeded)
+            logger.LogInformation("Admin password was reset via AdminSeed:ResetPasswordOnStart");
+    }
+
+    private static void LogIdentityErrors(ILogger logger, string message, IdentityResult result)
+    {
+        var errors = string.Join("; ", result.Errors.Select(e => $"{e.Code}: {e.Description}"));
+        logger.LogError("{Message} Errors: {Errors}", message, errors);
     }
 }
 
